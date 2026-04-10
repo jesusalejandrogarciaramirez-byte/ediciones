@@ -156,7 +156,6 @@ def render_external_link_button(label: str, url: str) -> None:
            display:block;
            width:100%;
            background:#1f77b4;
-           color:#ffffff !important;
            text-decoration:none !important;
            padding:0.75rem 1rem;
            border-radius:0.5rem;
@@ -166,7 +165,7 @@ def render_external_link_button(label: str, url: str) -> None:
            margin-bottom:0.25rem;
            box-sizing:border-box;
        ">
-        {label}
+        <span style="color:#ffffff !important;">{label}</span>
     </a>
     """
     st.markdown(html, unsafe_allow_html=True)
