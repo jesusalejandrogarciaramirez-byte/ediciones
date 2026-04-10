@@ -14,8 +14,8 @@ Aplicación en **Streamlit** que combina dos comportamientos:
 
 ## Diferenciación de nombres
 
-- periódicos de **Intelicast**: **(escaneado)**
-- periódicos originales: **(digital)**
+- periódicos **(escaneado)**
+- periódicos **(digital)**
 
 ## Instalación
 
