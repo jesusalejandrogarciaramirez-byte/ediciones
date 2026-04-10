@@ -155,7 +155,7 @@ def render_external_link_button(label: str, url: str) -> None:
        style="
            display:block;
            width:100%;
-           background:#1f77b4;
+           background:rgb(217 223 227);;
            text-decoration:none !important;
            padding:0.75rem 1rem;
            border-radius:0.5rem;
