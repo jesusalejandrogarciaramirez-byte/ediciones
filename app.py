@@ -152,19 +152,21 @@ def compact_logs(logs: List[str], limit: int = 5) -> str:
 def render_external_link_button(label: str, url: str) -> None:
     html = f"""
     <a href="{url}" target="_blank" rel="noopener noreferrer"
-       style="text-decoration:none !important; color:#ffffff !important;">
-        <div style="
-            background-color:#1f77b4;
-            color:#ffffff !important;
-            padding:0.75rem 1rem;
-            border-radius:0.5rem;
-            text-align:center;
-            font-weight:700;
-            margin-top:0.5rem;
-            margin-bottom:0.25rem;
-        ">
-            <span style="color:#ffffff !important;">{label}</span>
-        </div>
+       style="
+           display:block;
+           width:100%;
+           background:#1f77b4;
+           color:#ffffff !important;
+           text-decoration:none !important;
+           padding:0.75rem 1rem;
+           border-radius:0.5rem;
+           text-align:center;
+           font-weight:700;
+           margin-top:0.5rem;
+           margin-bottom:0.25rem;
+           box-sizing:border-box;
+       ">
+        {label}
     </a>
     """
     st.markdown(html, unsafe_allow_html=True)
