@@ -1,21 +1,18 @@
 # Descargador y visor de periódicos
 
-Aplicación en **Streamlit** que combina dos comportamientos:
+Esta versión deja el resultado exactamente en el mismo bloque donde se procesa cada periódico.
 
-- para periódicos con **PDF directo**, la app genera un **enlace** y lo muestra inmediatamente en el mismo bloque del procesamiento para abrirlo en una **nueva pestaña**;
-- para periódicos que se obtienen por **imágenes**, la app sigue descargando y armando el PDF como antes, pero con un log compacto.
+## Comportamiento
 
-## Cambios de esta versión
+- **PDF directo**: muestra ahí mismo el botón/enlace para abrir el PDF en una nueva pestaña.
+- **Por imágenes**: muestra ahí mismo el botón de descarga al terminar.
+- Ya no se crea un bloque adicional de resultado individual.
+- En masivo, cada periódico deja su enlace o botón dentro de su propio bloque.
+- El log visible de procesos por imágenes se limita a las últimas 5 líneas.
 
-- La fecha por defecto usa la zona horaria local del usuario configurada como **America/Guadalajara (UTC-6)**.
-- Los enlaces de PDFs directos aparecen **en el mismo div del proceso**, no en un bloque separado de resultados.
-- En procesos por imágenes, el log visible se limita a las **últimas 5 líneas**.
-- Se eliminó el mensaje que prometía intentos automáticos de descarga individual.
+## Zona horaria
 
-## Diferenciación de nombres
-
-- periódicos **(escaneado)**
-- periódicos **(digital)**
+La fecha por defecto usa la referencia de **America/Guadalajara (UTC-6)** para tomar el día actual.
 
 ## Instalación
 
@@ -27,13 +24,4 @@ pip install -r requirements.txt
 
 ```bash
 streamlit run app.py
-```
-
-## Estructura
-
-```text
-.
-├── app.py
-├── requirements.txt
-└── README.md
 ```
