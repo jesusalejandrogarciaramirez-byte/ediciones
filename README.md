@@ -9,7 +9,7 @@ Aplicación en **Streamlit** que combina dos comportamientos:
 
 Para distinguir fácilmente los tipos de fuente:
 
-- los periódicos de **Intelicast** aparecen como **(escaneado)**;
+- los periódicos de papel aparecen como **(escaneado)**;
 - los periódicos originales aparecen como **(digital)**.
 
 Ejemplos:
@@ -23,7 +23,7 @@ Estos periódicos no se descargan desde la app.
 La app construye el enlace y muestra un botón para abrirlo en otra pestaña.
 
 Aplica a:
-- todos los Intelicast `(escaneado)`;
+- todos los `(escaneado)`;
 - `El Financiero (digital)`;
 - `Excelsior (digital)`;
 - `La Jornada (digital)`;
