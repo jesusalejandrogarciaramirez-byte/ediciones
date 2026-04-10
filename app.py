@@ -3,13 +3,17 @@ import io
 import random
 import re
 import time
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple
 
 import requests
 import streamlit as st
 from PIL import Image
 
+
+APP_TIMEZONE = ZoneInfo("America/Mexico_City")
+TODAY_LOCAL = datetime.now(APP_TIMEZONE).date()
 
 st.set_page_config(page_title="Descargador y visor de periódicos", layout="wide")
 
@@ -36,7 +40,7 @@ EDITIONS: Dict[str, Dict[str, object]] = {
     "El Financiero (escaneado)": {
         "type": "intelicast_pdf",
         "pdf_name": "ElFinanciero5.pdf",
-        "published_weekdays": {0, 1, 2, 3, 4, 5, 6},
+        "published_weekdays": {0, 1, 2, 3, 4},
     },
     "La Cronica (escaneado)": {
         "type": "intelicast_pdf",
@@ -46,7 +50,7 @@ EDITIONS: Dict[str, Dict[str, object]] = {
     "El Economista (escaneado)": {
         "type": "intelicast_pdf",
         "pdf_name": "ElEconomista5.pdf",
-        "published_weekdays": {0, 1, 2, 3, 4, 5, 6},
+        "published_weekdays": {0, 1, 2, 3, 4},
     },
     "Publimetro (escaneado)": {
         "type": "intelicast_pdf",
@@ -56,12 +60,12 @@ EDITIONS: Dict[str, Dict[str, object]] = {
     "24 Horas (escaneado)": {
         "type": "intelicast_pdf",
         "pdf_name": "24Horas.pdf",
-        "published_weekdays": {0, 1, 2, 3, 4, 5, 6},
+        "published_weekdays": {0, 1, 2, 3, 4},
     },
     "Indigo (escaneado)": {
         "type": "intelicast_pdf",
         "pdf_name": "Indigo.pdf",
-        "published_weekdays": {0, 1, 2, 3, 4, 5, 6},
+        "published_weekdays": {0, 1, 2, 3, 4},
     },
     "ContraReplica (escaneado)": {
         "type": "intelicast_pdf",
@@ -81,12 +85,12 @@ EDITIONS: Dict[str, Dict[str, object]] = {
     "La Razon (escaneado)": {
         "type": "intelicast_pdf",
         "pdf_name": "LaRazon5.pdf",
-        "published_weekdays": {0, 1, 2, 3, 4, 5, 6},
+        "published_weekdays": {0, 1, 2, 3, 4, 5},
     },
     "Milenio (escaneado)": {
         "type": "intelicast_pdf",
         "pdf_name": "Milenio5.pdf",
-        "published_weekdays": {0, 1, 2, 3, 4, 5, 6},
+        "published_weekdays": {0, 1, 2, 3, 4, 5},
     },
     "La Jornada (escaneado)": {
         "type": "intelicast_pdf",
@@ -236,7 +240,6 @@ EDITIONS: Dict[str, Dict[str, object]] = {
 
 
 ORDERED_EDITIONS = [
-    # Intelicast
     "Reforma (escaneado)",
     "El Universal (escaneado)",
     "Excelsior (escaneado)",
@@ -257,7 +260,6 @@ ORDERED_EDITIONS = [
     "Unomasuno (escaneado)",
     "Metro (escaneado)",
     "La Prensa (escaneado)",
-    # Originales
     "El Universal (digital)",
     "El Financiero (digital)",
     "La Jornada (digital)",
@@ -284,8 +286,6 @@ def init_state() -> None:
         st.session_state.statuses = {}
     if "last_bulk_key" not in st.session_state:
         st.session_state.last_bulk_key = None
-    if "last_single_auto_key" not in st.session_state:
-        st.session_state.last_single_auto_key = None
 
 
 def sanitize_name(name: str) -> str:
@@ -295,19 +295,19 @@ def sanitize_name(name: str) -> str:
     return name
 
 
-def format_yyyymmdd(dt: date) -> str:
+def format_yyyymmdd(dt) -> str:
     return dt.strftime("%Y%m%d")
 
 
-def format_ddmmyy(dt: date) -> str:
+def format_ddmmyy(dt) -> str:
     return dt.strftime("%d%m%y")
 
 
-def format_ddmmyyyy(dt: date) -> str:
+def format_ddmmyyyy(dt) -> str:
     return dt.strftime("%d%m%Y")
 
 
-def build_milenio_or_universal_url(edition_name: str, dt: date, page: int) -> str:
+def build_milenio_or_universal_url(edition_name: str, dt, page: int) -> str:
     edition = EDITIONS[edition_name]
     edition_type = edition["type"]
 
@@ -328,7 +328,7 @@ def build_milenio_or_universal_url(edition_name: str, dt: date, page: int) -> st
     raise ValueError("Edición no soportada para descarga por imágenes")
 
 
-def build_pdf_link_url(edition_name: str, dt: date) -> str:
+def build_pdf_link_url(edition_name: str, dt) -> str:
     edition = EDITIONS[edition_name]
     edition_type = edition["type"]
 
@@ -380,7 +380,7 @@ def build_headers(url: str) -> Dict[str, str]:
     return base_headers
 
 
-def is_publication_day(edition_name: str, dt: date) -> bool:
+def is_publication_day(edition_name: str, dt) -> bool:
     allowed_days = EDITIONS[edition_name]["published_weekdays"]
     return dt.weekday() in allowed_days
 
@@ -428,7 +428,7 @@ def generate_pdf(images_data: List[Dict[str, object]]) -> bytes:
     return buffer.read()
 
 
-def save_result(edition_name: str, selected_date: date, pdf_bytes: bytes, logs: List[str]) -> None:
+def save_result(edition_name: str, selected_date, pdf_bytes: bytes, logs: List[str]) -> None:
     filename = f"{sanitize_name(edition_name)}_{selected_date.isoformat()}.pdf"
     st.session_state.results[edition_name] = {
         "edition_name": edition_name,
@@ -438,31 +438,6 @@ def save_result(edition_name: str, selected_date: date, pdf_bytes: bytes, logs: 
         "date": selected_date.isoformat(),
         "auto_key": f"{sanitize_name(edition_name)}_{selected_date.isoformat()}_{len(pdf_bytes)}",
     }
-
-
-def auto_download_one(result: Dict[str, object]) -> None:
-    file_b64 = base64.b64encode(result["pdf_bytes"]).decode()
-    filename = str(result["filename"]).replace('"', "")
-    auto_key = str(result["auto_key"])
-
-    st.components.v1.html(
-        f'''
-        <script>
-        (function() {{
-            const key = "single_download_{auto_key}";
-            if (sessionStorage.getItem(key)) return;
-            const a = document.createElement('a');
-            a.href = "data:application/pdf;base64,{file_b64}";
-            a.download = "{filename}";
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            sessionStorage.setItem(key, '1');
-        }})();
-        </script>
-        ''',
-        height=0,
-    )
 
 
 def auto_download_many(results: List[Dict[str, object]], key: str) -> None:
@@ -513,7 +488,7 @@ def render_external_link_button(label: str, url: str) -> None:
             border-radius:0.5rem;
             text-align:center;
             font-weight:600;
-            margin-top:0.25rem;
+            margin-top:0.5rem;
             margin-bottom:0.25rem;
         ">
             {label}
@@ -523,9 +498,15 @@ def render_external_link_button(label: str, url: str) -> None:
     st.markdown(html, unsafe_allow_html=True)
 
 
+def compact_logs(logs: List[str], limit: int = 5) -> str:
+    if len(logs) <= limit:
+        return "\n".join(logs)
+    return "\n".join(logs[-limit:])
+
+
 def process_images_workflow(
     edition_name: str,
-    selected_date: date,
+    selected_date,
     max_attempts: int,
     max_consecutive_failures: int,
     delay_seconds: float,
@@ -567,11 +548,11 @@ def process_images_workflow(
             if consecutive_failures >= int(max_consecutive_failures):
                 logs.append("Se alcanzó el límite de fallos consecutivos. Fin del proceso.")
                 progress_bar.progress(min(attempts / int(max_attempts), 1.0))
-                status_box.text("\n".join(logs[-12:]))
+                status_box.text(compact_logs(logs))
                 break
 
         progress_bar.progress(min(attempts / int(max_attempts), 1.0))
-        status_box.text("\n".join(logs[-12:]))
+        status_box.text(compact_logs(logs))
         info_box.info(
             f"{edition_name} | Páginas válidas: {len(images_data)} | "
             f"Intento: {attempts}/{int(max_attempts)} | Página actual: {page}"
@@ -587,13 +568,13 @@ def process_images_workflow(
     info_box.info(f"{edition_name} | Generando PDF con {len(images_data)} páginas...")
     pdf_bytes = generate_pdf(images_data)
     logs.append(f"✓ PDF generado con {len(images_data)} páginas")
-    status_box.text("\n".join(logs[-12:]))
+    status_box.text(compact_logs(logs))
     return pdf_bytes, logs
 
 
 def process_one_edition(
     edition_name: str,
-    selected_date: date,
+    selected_date,
     max_attempts: int,
     max_consecutive_failures: int,
     delay_seconds: float,
@@ -626,6 +607,7 @@ def process_one_edition(
             "logs": logs,
             "url": url,
         }
+        status_box.text(compact_logs(logs))
         info_box.success("Enlace listo")
         progress_bar.progress(1.0)
         return
@@ -647,7 +629,6 @@ def process_one_edition(
             "message": "Archivo listo",
             "logs": logs,
         }
-        st.session_state.last_single_auto_key = st.session_state.results[edition_name]["auto_key"]
         info_box.success("Archivo listo")
     except Exception as exc:
         msg = f"No se pudo completar: {exc}"
@@ -656,23 +637,23 @@ def process_one_edition(
             "message": msg,
             "logs": [msg],
         }
+        status_box.text(compact_logs([msg]))
         info_box.error(msg)
         progress_bar.progress(1.0)
 
 
 def run_bulk_download(
     edition_names: List[str],
-    selected_date: date,
+    selected_date,
     max_attempts: int,
     max_consecutive_failures: int,
     delay_seconds: float,
 ) -> None:
     st.session_state.results = {}
     st.session_state.statuses = {}
-    st.session_state.last_single_auto_key = None
 
     if not edition_names:
-        st.warning("Selecciona al menos una edición para la descarga masiva.")
+        st.warning("Selecciona al menos una edición para el proceso masivo.")
         return
 
     overall_progress = st.progress(0)
@@ -686,6 +667,7 @@ def run_bulk_download(
                 "status": st.empty(),
                 "info": st.empty(),
                 "progress": st.progress(0),
+                "action": st.empty(),
             }
 
     total = len(edition_names)
@@ -695,6 +677,7 @@ def run_bulk_download(
         status_box = edition_boxes[edition_name]["status"]
         info_box = edition_boxes[edition_name]["info"]
         progress_bar = edition_boxes[edition_name]["progress"]
+        action_box = edition_boxes[edition_name]["action"]
 
         process_one_edition(
             edition_name=edition_name,
@@ -707,71 +690,30 @@ def run_bulk_download(
             info_box=info_box,
         )
 
-        overall_progress.progress(idx / total)
+        status = st.session_state.statuses.get(edition_name)
+        result = st.session_state.results.get(edition_name)
 
-    overall_info.success("Proceso masivo terminado")
-    st.session_state.last_bulk_key = f"{selected_date.isoformat()}_{len(st.session_state.results)}"
-
-
-def render_result_cards() -> None:
-    st.subheader("Resultados")
-
-    display_editions = [
-        edition_name
-        for edition_name in ORDERED_EDITIONS
-        if edition_name in st.session_state.statuses or edition_name in st.session_state.results
-    ]
-
-    if not display_editions:
-        return
-
-    ready_results: List[Dict[str, object]] = []
-    for edition_name in display_editions:
-        with st.container(border=True):
-            st.markdown(f"**{edition_name}**")
-            status = st.session_state.statuses.get(edition_name)
-            result = st.session_state.results.get(edition_name)
-
-            if status:
-                state = status.get("state")
-                message = status.get("message", "")
-                if state == "ok":
-                    st.success(message)
-                elif state == "link":
-                    st.success(message)
-                elif state == "skipped":
-                    st.warning(message)
-                else:
-                    st.error(message)
-
+        with action_box.container():
             if status and status.get("state") == "link":
                 url = status.get("url", "")
                 if url:
-                    st.code(url)
                     render_external_link_button(f"Abrir {edition_name}", url)
-                with st.expander("Ver log del proceso"):
-                    st.text("\n".join(status.get("logs", [])))
-                continue
-
-            if result:
-                ready_results.append(result)
+            elif result:
                 st.download_button(
-                    label=f"Descargar manualmente: {result['filename']}",
+                    label=f"Descargar {result['filename']}",
                     data=result["pdf_bytes"],
                     file_name=result["filename"],
                     mime="application/pdf",
-                    key=f"manual_{sanitize_name(edition_name)}_{result['date']}",
+                    key=f"bulk_manual_{sanitize_name(edition_name)}_{result['date']}",
                     use_container_width=True,
                 )
 
-                with st.expander("Ver log del proceso"):
-                    st.text("\n".join(result.get("logs", [])))
-            elif status:
-                with st.expander("Ver log del proceso"):
-                    st.text("\n".join(status.get("logs", [])))
+        overall_progress.progress(idx / total)
 
-    if ready_results and st.session_state.last_bulk_key:
-        st.info("En los periódicos digitales por imágenes se intentará la descarga automática de los archivos listos.")
+    overall_info.success("Proceso masivo terminado")
+    ready_results = list(st.session_state.results.values())
+    if ready_results:
+        st.session_state.last_bulk_key = f"{selected_date.isoformat()}_{len(ready_results)}"
         auto_download_many(ready_results, st.session_state.last_bulk_key)
 
 
@@ -795,16 +737,17 @@ def render_single_result(edition_name: str) -> None:
         else:
             st.error(message)
 
+        with st.expander("Ver log del proceso"):
+            logs = result.get("logs", []) if result else status.get("logs", [])
+            st.text(compact_logs(logs))
+
         if state == "link":
             url = status.get("url", "")
             if url:
-                st.code(url)
                 render_external_link_button(f"Abrir {edition_name} en una nueva pestaña", url)
         elif result:
-            st.info("Se intentará la descarga automática de esta edición. Si el navegador la bloquea, usa el botón manual.")
-            auto_download_one(result)
             st.download_button(
-                label=f"Descargar manualmente: {result['filename']}",
+                label=f"Descargar {result['filename']}",
                 data=result["pdf_bytes"],
                 file_name=result["filename"],
                 mime="application/pdf",
@@ -812,21 +755,18 @@ def render_single_result(edition_name: str) -> None:
                 use_container_width=True,
             )
 
-        with st.expander("Ver log del proceso"):
-            logs = result.get("logs", []) if result else status.get("logs", [])
-            st.text("\n".join(logs))
-
 
 def main() -> None:
     init_state()
 
     st.title("Descargador y visor de periódicos")
+    st.caption("Zona horaria usada para la fecha por defecto: America/Guadalajara (UTC-6).")
     st.write(
         "Los periódicos escaneados y los digitales con PDF directo generan un enlace para abrirse en una nueva pestaña. "
         "Los periódicos digitales por imágenes siguen descargándose desde la app."
     )
 
-    selected_date = st.date_input("Fecha", value=date.today())
+    selected_date = st.date_input("Fecha", value=TODAY_LOCAL)
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -872,7 +812,7 @@ def main() -> None:
             type="primary",
         )
     with single_col2:
-        st.caption("Los PDF directos se abren por enlace. Los diarios por imágenes se descargan como antes.")
+        st.caption("Los PDF directos se abren por enlace. Los diarios por imágenes se descargan en la app.")
 
     if run_single:
         with st.container(border=True):
@@ -922,10 +862,6 @@ def main() -> None:
             max_consecutive_failures=int(max_consecutive_failures),
             delay_seconds=float(delay_seconds),
         )
-
-    if st.session_state.statuses:
-        st.divider()
-        render_result_cards()
 
 
 if __name__ == "__main__":

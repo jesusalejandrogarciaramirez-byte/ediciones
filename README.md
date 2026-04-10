@@ -2,44 +2,20 @@
 
 Aplicación en **Streamlit** que combina dos comportamientos:
 
-- para periódicos con **PDF directo**, la app genera un **enlace** y lo abre en una **nueva pestaña**;
-- para periódicos que se obtienen por **imágenes**, la app sigue descargando y armando el PDF como antes.
+- para periódicos con **PDF directo**, la app genera un **enlace** y lo muestra inmediatamente en el mismo bloque del procesamiento para abrirlo en una **nueva pestaña**;
+- para periódicos que se obtienen por **imágenes**, la app sigue descargando y armando el PDF como antes, pero con un log compacto.
+
+## Cambios de esta versión
+
+- La fecha por defecto usa la zona horaria local del usuario configurada como **America/Guadalajara (UTC-6)**.
+- Los enlaces de PDFs directos aparecen **en el mismo div del proceso**, no en un bloque separado de resultados.
+- En procesos por imágenes, el log visible se limita a las **últimas 5 líneas**.
+- Se eliminó el mensaje que prometía intentos automáticos de descarga individual.
 
 ## Diferenciación de nombres
 
-Para distinguir fácilmente los tipos de fuente:
-
-- los periódicos de papel aparecen como **(escaneado)**;
-- los periódicos originales aparecen como **(digital)**.
-
-Ejemplos:
-- `Reforma (escaneado)`
-- `El Universal (digital)`
-
-## Cómo funciona
-
-### 1. PDF directo
-Estos periódicos no se descargan desde la app.  
-La app construye el enlace y muestra un botón para abrirlo en otra pestaña.
-
-Aplica a:
-- todos los `(escaneado)`;
-- `El Financiero (digital)`;
-- `Excelsior (digital)`;
-- `La Jornada (digital)`;
-- `Adrenalina (digital)`;
-- `La Jornada EdoMex (digital)`.
-
-### 2. Por imágenes
-Estos siguen igual que antes:
-- descargan páginas como imágenes;
-- generan un PDF;
-- permiten descarga automática o manual.
-
-Aplica a:
-- `El Universal (digital)`;
-- todas las ediciones regionales de Milenio `(digital)`;
-- `La Afición (digital)`.
+- periódicos de **Intelicast**: **(escaneado)**
+- periódicos originales: **(digital)**
 
 ## Instalación
 
@@ -61,9 +37,3 @@ streamlit run app.py
 ├── requirements.txt
 └── README.md
 ```
-
-## Notas
-
-- Los enlaces o disponibilidades pueden cambiar sin previo aviso.
-- Los PDF directos se delegan al navegador y al sitio destino.
-- Los diarios por imágenes siguen usando `requests` y `Pillow` para reconstruir el PDF.
