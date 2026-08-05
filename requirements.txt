@@ -1,3 +1,5 @@
-streamlit>=1.33.0
-requests>=2.31.0
-Pillow>=10.0.0
+streamlit==1.60.0
+# Starlette 1.x cambió la firma interna de GZipResponder y rompe Streamlit 1.60.0.
+starlette==0.50.0
+requests>=2.31.0,<3
+Pillow>=10.0.0,<13
