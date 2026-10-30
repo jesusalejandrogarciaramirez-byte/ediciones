@@ -8,6 +8,7 @@ import tempfile
 import time
 import uuid
 from datetime import date
+from html import escape
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -23,6 +24,9 @@ LOGGER = logging.getLogger("ediciones")
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_IMAGE_PIXELS = 20_000_000
 MAX_PDF_BYTES = 100 * 1024 * 1024
+# Umbral de la descarga por la app. Los PDF directos de 100 MB o más
+# se abren desde su URL de origen, sin limitar su tamaño en el navegador.
+MAX_DIRECT_PDF_BYTES = 100_000_000
 MAX_SESSION_BYTES = 500 * 1024 * 1024
 AUTO_FILE_BYTES = 8 * 1024 * 1024
 AUTO_BATCH_BYTES = 16 * 1024 * 1024
@@ -291,8 +295,8 @@ ORDERED_EDITIONS = [
 
 
 def init_state() -> None:
-    # Al actualizar una sesión antigua, soltar los PDF que guardaba como bytes.
-    if st.session_state.get("result_schema") != 2:
+    # Al actualizar el formato de resultados, liberar la sesión anterior.
+    if st.session_state.get("result_schema") != 3:
         old_directory = st.session_state.pop("download_directory", None)
         if old_directory is not None:
             old_directory.cleanup()
@@ -300,7 +304,7 @@ def init_state() -> None:
         st.session_state.statuses = {}
         st.session_state.last_bulk_key = None
         st.session_state.auto_downloaded = set()
-        st.session_state.result_schema = 2
+        st.session_state.result_schema = 3
     if "results" not in st.session_state:
         st.session_state.results = {}
     if "statuses" not in st.session_state:
@@ -324,6 +328,7 @@ def remove_result(edition_name: str) -> None:
     result = st.session_state.results.pop(edition_name, None)
     if result and result.get("pdf_path"):
         Path(str(result["pdf_path"])).unlink(missing_ok=True)
+    if result:
         st.session_state.auto_downloaded.discard(str(result["auto_key"]))
     st.session_state.statuses.pop(edition_name, None)
 
@@ -470,22 +475,25 @@ def is_publication_day(edition_name: str, dt: date) -> bool:
     return dt.weekday() in allowed_days
 
 
-def response_chunks(response, max_bytes: int):
+def response_chunks(response, max_bytes: int, *, exclusive: bool = False):
     """Limita también respuestas sin Content-Length o comprimidas por HTTP."""
+    limit_message = (
+        f"El archivo alcanza o supera {max_bytes / 1_000_000:g} MB; abre el enlace de origen."
+        if exclusive else
+        f"El archivo supera el límite de {max_bytes // (1024 * 1024)} MB."
+    )
     declared_length = response.headers.get("Content-Length", "")
-    if declared_length.isdigit() and int(declared_length) > max_bytes:
-        raise ResourceLimitError(
-            f"El archivo supera el límite de {max_bytes // (1024 * 1024)} MB."
-        )
+    if declared_length.isdigit():
+        size = int(declared_length)
+        if size > max_bytes or (exclusive and size == max_bytes):
+            raise ResourceLimitError(limit_message)
     total = 0
     for chunk in response.iter_content(chunk_size=64 * 1024):
         if not chunk:
             continue
         total += len(chunk)
-        if total > max_bytes:
-            raise ResourceLimitError(
-                f"El archivo supera el límite de {max_bytes // (1024 * 1024)} MB."
-            )
+        if total > max_bytes or (exclusive and total == max_bytes):
+            raise ResourceLimitError(limit_message)
         yield chunk
     if total == 0:
         raise RuntimeError("Respuesta vacía")
@@ -525,7 +533,7 @@ def fetch_pdf(url: str, output_path: Path, timeout: int = 60) -> None:
             if response.status_code != 200:
                 raise RuntimeError(f"HTTP {response.status_code}")
             with output_path.open("wb") as destination:
-                for chunk in response_chunks(response, MAX_PDF_BYTES):
+                for chunk in response_chunks(response, MAX_DIRECT_PDF_BYTES, exclusive=True):
                     destination.write(chunk)
         with output_path.open("rb") as source:
             if b"%PDF-" not in source.read(1024):
@@ -566,7 +574,13 @@ def append_image_to_pdf(image_bytes: bytes, output_path: Path, append: bool) -> 
         raise ResourceLimitError("El PDF generado supera el límite de 100 MB.")
 
 
-def save_result(edition_name: str, selected_date: date, pdf_path: Path, logs: List[str]) -> None:
+def save_result(
+    edition_name: str,
+    selected_date: date,
+    pdf_path: Path,
+    logs: List[str],
+    source_url: str | None = None,
+) -> None:
     filename = f"{sanitize_name(edition_name)}_{selected_date.isoformat()}.pdf"
     size = pdf_path.stat().st_size
     retained_size = sum(int(result["size_bytes"]) for result in st.session_state.results.values())
@@ -583,6 +597,23 @@ def save_result(edition_name: str, selected_date: date, pdf_path: Path, logs: Li
         "logs": logs,
         "date": selected_date.isoformat(),
         "auto_key": pdf_path.stem,
+        "source_url": source_url,
+    }
+
+
+def save_source_link(
+    edition_name: str, selected_date: date, source_url: str, logs: List[str]
+) -> None:
+    """Un enlace de origen no consume la cuota de archivos de la sesión."""
+    st.session_state.results[edition_name] = {
+        "edition_name": edition_name,
+        "filename": f"{sanitize_name(edition_name)}_{selected_date.isoformat()}.pdf",
+        "pdf_path": None,
+        "size_bytes": 0,
+        "source_url": source_url,
+        "logs": logs,
+        "date": selected_date.isoformat(),
+        "auto_key": f"source_{uuid.uuid4().hex}",
     }
 
 
@@ -624,6 +655,8 @@ def emit_auto_downloads(results: List[Dict[str, object]], key: str) -> None:
 
 
 def auto_download_one(result: Dict[str, object]) -> None:
+    if not result.get("pdf_path"):
+        return
     key = str(result["auto_key"])
     if key in st.session_state.auto_downloaded:
         return
@@ -639,6 +672,8 @@ def auto_download_many(results: List[Dict[str, object]], key: str) -> None:
     eligible = []
     total_bytes = 0
     for result in results:
+        if not result.get("pdf_path"):
+            continue
         size = int(result["size_bytes"])
         if str(result["auto_key"]) in st.session_state.auto_downloaded:
             continue
@@ -656,6 +691,15 @@ def auto_download_many(results: List[Dict[str, object]], key: str) -> None:
 
 
 def render_download_button(result: Dict[str, object], key: str) -> None:
+    if result.get("source_url"):
+        url = escape(str(result["source_url"]), quote=True)
+        st.markdown(
+            f'<a href="{url}" target="_blank" rel="noopener noreferrer">'
+            'Abrir / descargar PDF desde el sitio de origen ↗</a>',
+            unsafe_allow_html=True,
+        )
+    if not result.get("pdf_path"):
+        return
     path = Path(str(result["pdf_path"]))
     st.download_button(
         label=f"Descargar: {result['filename']}",
@@ -741,9 +785,10 @@ def process_direct_pdf_workflow(
     selected_date: date,
     status_box,
     info_box,
+    source_url: str | None = None,
 ) -> Tuple[Path, List[str]]:
     logs: List[str] = []
-    url = build_direct_pdf_url(edition_name, selected_date)
+    url = source_url if source_url is not None else build_direct_pdf_url(edition_name, selected_date)
     logs.append(f"Intentando descarga directa del PDF: {url}")
     status_box.text("\n".join(logs[-5:]))
     info_box.info(f"{edition_name} | Descargando PDF...")
@@ -772,16 +817,24 @@ def process_one_edition(
 
     if not is_publication_day(edition_name, selected_date):
         msg = "Hoy no se publica"
+        logs = [msg]
+        if EDITIONS[edition_name]["type"] not in {"milenio", "el_universal"}:
+            source_url = build_direct_pdf_url(edition_name, selected_date)
+            msg = "El calendario no indica publicación. Puedes consultar el enlace de origen."
+            logs.append(msg)
+            save_source_link(edition_name, selected_date, source_url, logs)
         st.session_state.statuses[edition_name] = {
             "state": "skipped",
             "message": msg,
-            "logs": [msg],
+            "logs": logs,
         }
         info_box.warning(msg)
         progress_bar.progress(1.0)
         return
 
     pdf_path = None
+    source_url = None
+    logs: List[str] = []
     try:
         edition_type = EDITIONS[edition_name]["type"]
         if edition_type in {"milenio", "el_universal"}:
@@ -796,15 +849,18 @@ def process_one_edition(
                 info_box=info_box,
             )
         else:
+            # Construir una sola vez; El Financiero incluye un parámetro variable.
+            source_url = build_direct_pdf_url(edition_name, selected_date)
             pdf_path, logs = process_direct_pdf_workflow(
                 edition_name=edition_name,
                 selected_date=selected_date,
                 status_box=status_box,
                 info_box=info_box,
+                source_url=source_url,
             )
             progress_bar.progress(1.0)
 
-        save_result(edition_name, selected_date, pdf_path, logs)
+        save_result(edition_name, selected_date, pdf_path, logs, source_url=source_url)
         st.session_state.statuses[edition_name] = {
             "state": "ok",
             "message": "Archivo listo",
@@ -816,14 +872,27 @@ def process_one_edition(
         remove_result(edition_name)
         if pdf_path is not None:
             pdf_path.unlink(missing_ok=True)
-        LOGGER.exception("Error al procesar %s, fecha %s", edition_name, selected_date)
-        msg = f"No se pudo completar: {exc}"
+        use_source = bool(source_url)
+        external_only = use_source and isinstance(exc, ResourceLimitError)
+        if external_only:
+            msg = "Abre el PDF desde el sitio de origen para descargarlo."
+        else:
+            LOGGER.exception("Error al procesar %s, fecha %s", edition_name, selected_date)
+            msg = f"No se pudo completar la descarga en la app: {exc}"
+            if use_source:
+                msg += " Puedes intentar abrir el enlace de origen."
+        logs = [*logs, str(exc), msg]
+        if use_source:
+            save_source_link(edition_name, selected_date, source_url, logs)
         st.session_state.statuses[edition_name] = {
-            "state": "error",
+            "state": "external" if external_only else "error",
             "message": msg,
-            "logs": [msg],
+            "logs": logs,
         }
-        info_box.error(msg)
+        if external_only:
+            info_box.info(msg)
+        else:
+            info_box.error(msg)
         progress_bar.progress(1.0)
     finally:
         # Una cancelación/rerun de Streamlit hereda de BaseException. Si ocurre
@@ -912,13 +981,16 @@ def render_result_cards() -> None:
                 message = status.get("message", "")
                 if state == "ok":
                     st.success(message)
+                elif state == "external":
+                    st.info(message)
                 elif state == "skipped":
                     st.warning(message)
                 else:
                     st.error(message)
 
             if result:
-                ready_results.append(result)
+                if result.get("pdf_path"):
+                    ready_results.append(result)
                 render_download_button(result, key=f"manual_{result['auto_key']}")
 
                 with st.expander("Ver log del proceso"):
@@ -948,13 +1020,16 @@ def render_single_result(edition_name: str) -> None:
         message = status.get("message", "")
         if state == "ok":
             st.success(message)
+        elif state == "external":
+            st.info(message)
         elif state == "skipped":
             st.warning(message)
         else:
             st.error(message)
 
         if result:
-            st.info("Si el archivo es pequeño, se intentará descargar automáticamente. También puedes usar el botón.")
+            if result.get("pdf_path"):
+                st.info("Puedes descargar el archivo con el botón. Si es pequeño, también se intentará la descarga automática.")
             auto_download_one(result)
             render_download_button(result, key=f"single_manual_{result['auto_key']}")
 
@@ -1024,7 +1099,10 @@ def main() -> None:
             type="primary",
         )
     with single_col2:
-        st.caption("Se intentará la descarga automática de archivos pequeños; siempre quedará el botón de descarga.")
+        st.caption(
+            "PDF directos menores de 100 MB: descarga desde la app. "
+            "De 100 MB o más: enlace de origen en una nueva pestaña."
+        )
 
     if run_single:
         st.session_state.last_bulk_key = None
