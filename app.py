@@ -1,4 +1,3 @@
-import base64
 import io
 import json
 import logging
@@ -11,6 +10,7 @@ from datetime import date
 from html import escape
 from pathlib import Path
 from typing import Dict, List, Tuple
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -21,6 +21,8 @@ st.set_page_config(page_title="Descargador de periódicos", layout="wide")
 
 
 LOGGER = logging.getLogger("ediciones")
+APP_DIR = Path(__file__).resolve().parent
+DOWNLOADS_ROOT = APP_DIR / "static" / "descargas"
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_IMAGE_PIXELS = 20_000_000
 MAX_PDF_BYTES = 100 * 1024 * 1024
@@ -28,8 +30,7 @@ MAX_PDF_BYTES = 100 * 1024 * 1024
 # se abren desde su URL de origen, sin limitar su tamaño en el navegador.
 MAX_DIRECT_PDF_BYTES = 100_000_000
 MAX_SESSION_BYTES = 500 * 1024 * 1024
-AUTO_FILE_BYTES = 8 * 1024 * 1024
-AUTO_BATCH_BYTES = 16 * 1024 * 1024
+AUTO_FILE_BYTES = 100_000_000
 
 
 class ResourceLimitError(RuntimeError):
@@ -296,7 +297,7 @@ ORDERED_EDITIONS = [
 
 def init_state() -> None:
     # Al actualizar el formato de resultados, liberar la sesión anterior.
-    if st.session_state.get("result_schema") != 3:
+    if st.session_state.get("result_schema") != 4:
         old_directory = st.session_state.pop("download_directory", None)
         if old_directory is not None:
             old_directory.cleanup()
@@ -304,7 +305,7 @@ def init_state() -> None:
         st.session_state.statuses = {}
         st.session_state.last_bulk_key = None
         st.session_state.auto_downloaded = set()
-        st.session_state.result_schema = 3
+        st.session_state.result_schema = 4
     if "results" not in st.session_state:
         st.session_state.results = {}
     if "statuses" not in st.session_state:
@@ -315,8 +316,9 @@ def init_state() -> None:
         st.session_state.last_single_auto_key = None
     if "download_directory" not in st.session_state:
         # TemporaryDirectory se limpia cuando Streamlit libera la sesión.
+        DOWNLOADS_ROOT.mkdir(parents=True, exist_ok=True)
         st.session_state.download_directory = tempfile.TemporaryDirectory(
-            prefix="ediciones_"
+            prefix="s_", dir=DOWNLOADS_ROOT
         )
 
 
@@ -521,6 +523,7 @@ def fetch_image(url: str, timeout: int = 30) -> Tuple[bytes, str]:
 
 def fetch_pdf(url: str, output_path: Path, timeout: int = 60) -> None:
     """Transfiere el PDF a disco sin conservar la respuesta completa en RAM."""
+    partial_path = output_path.with_suffix(".part")
     try:
         with requests.get(
             url,
@@ -532,15 +535,16 @@ def fetch_pdf(url: str, output_path: Path, timeout: int = 60) -> None:
         ) as response:
             if response.status_code != 200:
                 raise RuntimeError(f"HTTP {response.status_code}")
-            with output_path.open("wb") as destination:
+            with partial_path.open("wb") as destination:
                 for chunk in response_chunks(response, MAX_DIRECT_PDF_BYTES, exclusive=True):
                     destination.write(chunk)
-        with output_path.open("rb") as source:
+        with partial_path.open("rb") as source:
             if b"%PDF-" not in source.read(1024):
                 raise RuntimeError("El servidor no devolvió un PDF válido")
-    except BaseException:
-        output_path.unlink(missing_ok=True)
-        raise
+        # Una única copia final, anunciada solo después de validarse.
+        partial_path.replace(output_path)
+    finally:
+        partial_path.unlink(missing_ok=True)
 
 
 def append_image_to_pdf(image_bytes: bytes, output_path: Path, append: bool) -> None:
@@ -617,76 +621,86 @@ def save_source_link(
     }
 
 
+def static_url(relative_path: str) -> str:
+    base_path = str(st.get_option("server.baseUrlPath") or "").strip("/")
+    prefix = f"/{base_path}" if base_path else ""
+    return f"{prefix}/app/static/{quote(relative_path, safe='/')}"
+
+
 def emit_auto_downloads(results: List[Dict[str, object]], key: str) -> None:
-    """Solo recibe lotes pequeños; nunca vuelve a emitirlos en un rerun."""
-    files = []
-    for result in results:
-        file_b64 = base64.b64encode(Path(str(result["pdf_path"])).read_bytes()).decode("ascii")
-        files.append({
-            "href": f"data:application/pdf;base64,{file_b64}",
-            "download": str(result["filename"]),
-        })
+    """Envía solo metadatos; el navegador recibe cada PDF por streaming."""
+    if not st.get_option("server.enableStaticServing"):
+        return
+    files = [
+        {
+            "id": str(result["auto_key"]),
+            "url": static_url(
+                "descargas/" + Path(str(result["pdf_path"])).relative_to(DOWNLOADS_ROOT).as_posix()
+            ),
+            "filename": str(result["filename"]),
+            "size": int(result["size_bytes"]),
+        }
+        for result in results
+        if result.get("pdf_path") and int(result["size_bytes"]) < AUTO_FILE_BYTES
+    ]
+    files_json = json.dumps(files).replace("</", "<\\/")
+    script_url = json.dumps(static_url("descargador.js") + "?v=1")
     st.iframe(
         f"""
+        <style>body{{margin:0;font:13px system-ui,sans-serif;color:#777}}</style>
+        <div id="estado" role="status" aria-live="polite"></div>
         <script>
         (function() {{
-            const key = {json.dumps(key)};
-            try {{ if (sessionStorage.getItem(key)) return; }} catch (e) {{}}
-            const files = {json.dumps(files)};
-            files.forEach((file, index) => {{
-                setTimeout(() => {{
-                    const a = document.createElement('a');
-                    a.href = file.href;
-                    a.download = file.download;
-                    document.body.appendChild(a);
-                    a.click();
-                    a.remove();
-                }}, index * 500);
-            }});
-            try {{ sessionStorage.setItem(key, '1'); }} catch (e) {{}}
+            const owner = window.parent;
+            const files = {files_json};
+            const status = document.getElementById("estado");
+            function start() {{
+                owner.__edicionesDownloads.enqueue(files);
+                function refresh() {{
+                    if (!files.length) return;
+                    const states = owner.__edicionesDownloads.status(files.map(file => file.id));
+                    const sent = states.filter(state => state === "sent").length;
+                    const failed = states.filter(state => state === "error").length;
+                    status.textContent = failed
+                        ? `${{sent}}/${{files.length}} enviados al navegador. Usa el botón para los archivos pendientes.`
+                        : sent === files.length
+                            ? `${{sent}} descarga(s) enviada(s) al navegador.`
+                            : `Preparando descarga automática ${{Math.min(sent + 1, files.length)}}/${{files.length}}…`;
+                }}
+                refresh();
+                const timer = window.setInterval(refresh, 300);
+                window.addEventListener("pagehide", () => window.clearInterval(timer), {{once:true}});
+            }}
+            if (owner.__edicionesDownloads) {{ start(); return; }}
+            let loader = owner.document.getElementById("ediciones-descargador-js");
+            if (!loader) {{
+                loader = owner.document.createElement("script");
+                loader.id = "ediciones-descargador-js";
+                loader.src = new URL({script_url}, owner.location.href).href;
+                loader.addEventListener("load", start, {{once:true}});
+                loader.addEventListener("error", () => {{
+                    status.textContent = "No se pudo iniciar la descarga automática. Usa el botón de descarga.";
+                    loader.remove();
+                }}, {{once:true}});
+                owner.document.head.appendChild(loader);
+            }} else {{ loader.addEventListener("load", start, {{once:true}}); }}
         }})();
         </script>
         """,
-        height=1,
+        height=42 if files else 1,
         tab_index=-1,
     )
-    st.session_state.auto_downloaded.add(key)
-    st.session_state.auto_downloaded.update(str(result["auto_key"]) for result in results)
 
 
 def auto_download_one(result: Dict[str, object]) -> None:
-    if not result.get("pdf_path"):
-        return
-    key = str(result["auto_key"])
-    if key in st.session_state.auto_downloaded:
-        return
-    if int(result["size_bytes"]) > AUTO_FILE_BYTES:
-        st.caption("Para este archivo grande, utiliza el botón de descarga.")
-        return
-    emit_auto_downloads([result], key)
+    emit_auto_downloads([result], str(result["auto_key"]))
 
 
 def auto_download_many(results: List[Dict[str, object]], key: str) -> None:
-    if not results or key in st.session_state.auto_downloaded:
-        return
-    eligible = []
-    total_bytes = 0
-    for result in results:
-        if not result.get("pdf_path"):
-            continue
-        size = int(result["size_bytes"])
-        if str(result["auto_key"]) in st.session_state.auto_downloaded:
-            continue
-        if size <= AUTO_FILE_BYTES and total_bytes + size <= AUTO_BATCH_BYTES:
-            eligible.append(result)
-            total_bytes += size
-    if eligible:
-        emit_auto_downloads(eligible, key)
-    else:
-        st.session_state.auto_downloaded.add(key)
+    emit_auto_downloads(results, key)
     st.caption(
-        "La descarga automática se limita a archivos de hasta 8 MB y a 16 MB por lote. "
-        "Todos los archivos listos pueden descargarse con sus botones."
+        "Los PDF listos de menos de 100 MB se descargan automáticamente, uno por uno. "
+        "Si el navegador solicita permiso para varias descargas, permite las de este sitio."
     )
 
 
@@ -726,6 +740,7 @@ def process_images_workflow(
     edition = EDITIONS[edition_name]
     start_page = int(edition["start_page"])
     output_path = new_pdf_path()
+    partial_path = output_path.with_suffix(".part")
     valid_pages = 0
     logs: List[str] = []
     consecutive_failures = 0
@@ -739,7 +754,7 @@ def process_images_workflow(
             try:
                 image_bytes, _ = fetch_image(url)
                 try:
-                    append_image_to_pdf(image_bytes, output_path, append=valid_pages > 0)
+                    append_image_to_pdf(image_bytes, partial_path, append=valid_pages > 0)
                 finally:
                     del image_bytes
                 valid_pages += 1
@@ -774,8 +789,10 @@ def process_images_workflow(
         logs.append(f"✓ PDF generado con {valid_pages} páginas")
         status_box.text("\n".join(logs[-5:]))
         progress_bar.progress(1.0)
+        partial_path.replace(output_path)
         return output_path, logs
     except BaseException:
+        partial_path.unlink(missing_ok=True)
         output_path.unlink(missing_ok=True)
         raise
 
@@ -999,8 +1016,9 @@ def render_result_cards() -> None:
                 with st.expander("Ver log del proceso"):
                     st.text("\n".join(status.get("logs", [])))
 
-    if ready_results and st.session_state.last_bulk_key:
-        st.info("Los archivos pequeños intentarán descargarse automáticamente. Usa los botones para los demás.")
+    if st.session_state.last_bulk_key:
+        if ready_results:
+            st.info("La descarga automática comenzará al terminar el proceso. Los botones quedan como respaldo.")
         auto_download_many(ready_results, st.session_state.last_bulk_key)
 
 
@@ -1029,7 +1047,7 @@ def render_single_result(edition_name: str) -> None:
 
         if result:
             if result.get("pdf_path"):
-                st.info("Puedes descargar el archivo con el botón. Si es pequeño, también se intentará la descarga automática.")
+                st.info("La descarga de los PDF menores de 100 MB comienza automáticamente. El botón queda como respaldo.")
             auto_download_one(result)
             render_download_button(result, key=f"single_manual_{result['auto_key']}")
 
@@ -1046,6 +1064,12 @@ def main() -> None:
         "Descarga masiva o individual para diarios Intelicast y otras ediciones "
         "como Milenio, El Universal, Excelsior, La Jornada y El Financiero."
     )
+    if not st.get_option("server.enableStaticServing"):
+        st.error(
+            "Para activar la descarga automática, sube también el archivo "
+            ".streamlit/config.toml incluido en el ZIP y reinicia la aplicación. "
+            "Los botones de descarga siguen disponibles."
+        )
 
     selected_date = st.date_input("Fecha", value=date.today())
     # No mezclar los archivos de una fecha anterior con la fecha seleccionada.
@@ -1100,11 +1124,12 @@ def main() -> None:
         )
     with single_col2:
         st.caption(
-            "PDF directos menores de 100 MB: descarga desde la app. "
+            "PDF directos menores de 100 MB: descarga automática. "
             "De 100 MB o más: enlace de origen en una nueva pestaña."
         )
 
     if run_single:
+        emit_auto_downloads([], "new_single")
         st.session_state.last_bulk_key = None
         with st.container(border=True):
             st.subheader(selected_edition)
@@ -1146,6 +1171,7 @@ def main() -> None:
     st.caption(f"Se procesarán {len(selected_bulk_editions)} edición(es) en la masiva.")
 
     if st.button("Iniciar descarga masiva", width="stretch"):
+        emit_auto_downloads([], "new_bulk")
         run_bulk_download(
             edition_names=selected_bulk_editions,
             selected_date=selected_date,
@@ -1162,6 +1188,9 @@ def main() -> None:
     if st.session_state.statuses:
         st.divider()
         render_result_cards()
+    else:
+        # Detener cualquier cola anterior al limpiar o cambiar la fecha.
+        emit_auto_downloads([], "idle")
 
 
 if __name__ == "__main__":
