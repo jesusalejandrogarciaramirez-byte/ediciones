@@ -1,9 +1,14 @@
 import base64
 import io
+import json
+import logging
 import random
 import re
+import tempfile
 import time
+import uuid
 from datetime import date
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import requests
@@ -12,6 +17,23 @@ from PIL import Image
 
 
 st.set_page_config(page_title="Descargador de periódicos", layout="wide")
+
+
+LOGGER = logging.getLogger("ediciones")
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
+MAX_IMAGE_PIXELS = 20_000_000
+MAX_PDF_BYTES = 100 * 1024 * 1024
+MAX_SESSION_BYTES = 500 * 1024 * 1024
+AUTO_FILE_BYTES = 8 * 1024 * 1024
+AUTO_BATCH_BYTES = 16 * 1024 * 1024
+
+
+class ResourceLimitError(RuntimeError):
+    """Detiene una descarga antes de que agote los recursos de la aplicación."""
+
+
+class PdfWriteError(RuntimeError):
+    """Un error al guardar no puede tratarse como una página ausente."""
 
 
 EDITIONS: Dict[str, Dict[str, object]] = {
@@ -269,6 +291,16 @@ ORDERED_EDITIONS = [
 
 
 def init_state() -> None:
+    # Al actualizar una sesión antigua, soltar los PDF que guardaba como bytes.
+    if st.session_state.get("result_schema") != 2:
+        old_directory = st.session_state.pop("download_directory", None)
+        if old_directory is not None:
+            old_directory.cleanup()
+        st.session_state.results = {}
+        st.session_state.statuses = {}
+        st.session_state.last_bulk_key = None
+        st.session_state.auto_downloaded = set()
+        st.session_state.result_schema = 2
     if "results" not in st.session_state:
         st.session_state.results = {}
     if "statuses" not in st.session_state:
@@ -277,6 +309,32 @@ def init_state() -> None:
         st.session_state.last_bulk_key = None
     if "last_single_auto_key" not in st.session_state:
         st.session_state.last_single_auto_key = None
+    if "download_directory" not in st.session_state:
+        # TemporaryDirectory se limpia cuando Streamlit libera la sesión.
+        st.session_state.download_directory = tempfile.TemporaryDirectory(
+            prefix="ediciones_"
+        )
+
+
+def new_pdf_path() -> Path:
+    return Path(st.session_state.download_directory.name) / f"{uuid.uuid4().hex}.pdf"
+
+
+def remove_result(edition_name: str) -> None:
+    result = st.session_state.results.pop(edition_name, None)
+    if result and result.get("pdf_path"):
+        Path(str(result["pdf_path"])).unlink(missing_ok=True)
+        st.session_state.auto_downloaded.discard(str(result["auto_key"]))
+    st.session_state.statuses.pop(edition_name, None)
+
+
+def clear_results() -> None:
+    for edition_name in list(st.session_state.results):
+        remove_result(edition_name)
+    st.session_state.statuses = {}
+    st.session_state.auto_downloaded = set()
+    st.session_state.last_bulk_key = None
+    st.session_state.last_single_auto_key = None
 
 
 def sanitize_name(name: str) -> str:
@@ -412,130 +470,138 @@ def is_publication_day(edition_name: str, dt: date) -> bool:
     return dt.weekday() in allowed_days
 
 
+def response_chunks(response, max_bytes: int):
+    """Limita también respuestas sin Content-Length o comprimidas por HTTP."""
+    declared_length = response.headers.get("Content-Length", "")
+    if declared_length.isdigit() and int(declared_length) > max_bytes:
+        raise ResourceLimitError(
+            f"El archivo supera el límite de {max_bytes // (1024 * 1024)} MB."
+        )
+    total = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise ResourceLimitError(
+                f"El archivo supera el límite de {max_bytes // (1024 * 1024)} MB."
+            )
+        yield chunk
+    if total == 0:
+        raise RuntimeError("Respuesta vacía")
+
+
 def fetch_image(url: str, timeout: int = 30) -> Tuple[bytes, str]:
-    response = requests.get(
+    with requests.get(
         url,
         headers=build_headers(url),
-        timeout=timeout,
+        timeout=(10, timeout),
         allow_redirects=True,
         verify=True,
-    )
-
-    if response.status_code != 200:
-        raise RuntimeError(f"HTTP {response.status_code}")
-
-    content_type = (response.headers.get("Content-Type") or "").lower()
-    if "image" not in content_type:
-        raise RuntimeError(f"Contenido no es imagen: {content_type or 'desconocido'}")
-
-    if not response.content:
-        raise RuntimeError("Respuesta vacía")
-
-    return response.content, content_type
+        stream=True,
+    ) as response:
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        if "image" not in content_type:
+            raise RuntimeError(f"Contenido no es imagen: {content_type or 'desconocido'}")
+        with io.BytesIO() as buffer:
+            for chunk in response_chunks(response, MAX_IMAGE_BYTES):
+                buffer.write(chunk)
+            return buffer.getvalue(), content_type
 
 
-def fetch_pdf(url: str, timeout: int = 60) -> bytes:
-    response = requests.get(
-        url,
-        headers=build_headers(url),
-        timeout=timeout,
-        allow_redirects=True,
-        verify=True,
-    )
-
-    if response.status_code != 200:
-        raise RuntimeError(f"HTTP {response.status_code}")
-
-    content_type = (response.headers.get("Content-Type") or "").lower()
-    looks_like_pdf = response.content[:4] == b"%PDF"
-
-    if "pdf" not in content_type and not looks_like_pdf and response.content:
-        raise RuntimeError(f"Contenido no es PDF: {content_type or 'desconocido'}")
-
-    if not response.content:
-        raise RuntimeError("Respuesta vacía")
-
-    return response.content
-
-
-def generate_pdf(images_data: List[Dict[str, object]]) -> bytes:
-    if not images_data:
-        raise ValueError("No hay imágenes para generar el PDF")
-
-    pil_images: List[Image.Image] = []
-    for item in images_data:
-        image_bytes = item["bytes"]
-        img = Image.open(io.BytesIO(image_bytes))
-        if img.mode in ("RGBA", "LA", "P"):
-            img = img.convert("RGB")
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
-        pil_images.append(img)
-
-    buffer = io.BytesIO()
-    first_image, *rest = pil_images
-    first_image.save(buffer, format="PDF", save_all=True, append_images=rest)
-    buffer.seek(0)
-    return buffer.read()
+def fetch_pdf(url: str, output_path: Path, timeout: int = 60) -> None:
+    """Transfiere el PDF a disco sin conservar la respuesta completa en RAM."""
+    try:
+        with requests.get(
+            url,
+            headers=build_headers(url),
+            timeout=(10, timeout),
+            allow_redirects=True,
+            verify=True,
+            stream=True,
+        ) as response:
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code}")
+            with output_path.open("wb") as destination:
+                for chunk in response_chunks(response, MAX_PDF_BYTES):
+                    destination.write(chunk)
+        with output_path.open("rb") as source:
+            if b"%PDF-" not in source.read(1024):
+                raise RuntimeError("El servidor no devolvió un PDF válido")
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        raise
 
 
-def save_result(edition_name: str, selected_date: date, pdf_bytes: bytes, logs: List[str]) -> None:
+def append_image_to_pdf(image_bytes: bytes, output_path: Path, append: bool) -> None:
+    """Decodifica y cierra una sola página; Pillow añade el PDF en disco."""
+    previous_size = output_path.stat().st_size if append else 0
+    with io.BytesIO(image_bytes) as source, Image.open(source) as image:
+        if image.width * image.height > MAX_IMAGE_PIXELS:
+            raise ResourceLimitError("La imagen supera el límite de 20 megapíxeles.")
+        # Validar antes de escribir evita añadir páginas de imágenes corruptas.
+        image.load()
+        rgb_image = image if image.mode == "RGB" else image.convert("RGB")
+        try:
+            rgb_image.save(output_path, format="PDF", append=append)
+        except BaseException as exc:
+            # Un fallo de escritura no debe dañar las páginas ya terminadas.
+            try:
+                if append:
+                    with output_path.open("r+b") as destination:
+                        destination.truncate(previous_size)
+                else:
+                    output_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.exception("No se pudo restaurar el PDF tras un fallo de escritura")
+            if isinstance(exc, Exception):
+                raise PdfWriteError("No se pudo guardar el PDF. Vuelve a intentar esta edición.") from exc
+            raise
+        finally:
+            if rgb_image is not image:
+                rgb_image.close()
+    if output_path.stat().st_size > MAX_PDF_BYTES:
+        raise ResourceLimitError("El PDF generado supera el límite de 100 MB.")
+
+
+def save_result(edition_name: str, selected_date: date, pdf_path: Path, logs: List[str]) -> None:
     filename = f"{sanitize_name(edition_name)}_{selected_date.isoformat()}.pdf"
+    size = pdf_path.stat().st_size
+    retained_size = sum(int(result["size_bytes"]) for result in st.session_state.results.values())
+    if retained_size + size > MAX_SESSION_BYTES:
+        raise ResourceLimitError(
+            "Los resultados de esta sesión superan 500 MB. "
+            "Descarga los archivos listos y pulsa 'Limpiar resultados' antes de continuar."
+        )
     st.session_state.results[edition_name] = {
         "edition_name": edition_name,
         "filename": filename,
-        "pdf_bytes": pdf_bytes,
+        "pdf_path": str(pdf_path),
+        "size_bytes": size,
         "logs": logs,
         "date": selected_date.isoformat(),
-        "auto_key": f"{sanitize_name(edition_name)}_{selected_date.isoformat()}_{len(pdf_bytes)}",
+        "auto_key": pdf_path.stem,
     }
 
 
-def auto_download_one(result: Dict[str, object]) -> None:
-    file_b64 = base64.b64encode(result["pdf_bytes"]).decode()
-    filename = str(result["filename"]).replace('"', "")
-    auto_key = str(result["auto_key"])
-
-    st.components.v1.html(
-        f"""
-        <script>
-        (function() {{
-            const key = "single_download_{auto_key}";
-            if (sessionStorage.getItem(key)) return;
-            const a = document.createElement('a');
-            a.href = "data:application/pdf;base64,{file_b64}";
-            a.download = "{filename}";
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            sessionStorage.setItem(key, '1');
-        }})();
-        </script>
-        """,
-        height=0,
-    )
-
-
-def auto_download_many(results: List[Dict[str, object]], key: str) -> None:
-    if not results:
-        return
-
-    anchors = []
+def emit_auto_downloads(results: List[Dict[str, object]], key: str) -> None:
+    """Solo recibe lotes pequeños; nunca vuelve a emitirlos en un rerun."""
+    files = []
     for result in results:
-        file_b64 = base64.b64encode(result["pdf_bytes"]).decode()
-        filename = str(result["filename"]).replace('"', "")
-        anchors.append(
-            f'{{href: "data:application/pdf;base64,{file_b64}", download: "{filename}"}}'
-        )
-
-    js_array = ",\n".join(anchors)
-    st.components.v1.html(
+        file_b64 = base64.b64encode(Path(str(result["pdf_path"])).read_bytes()).decode("ascii")
+        files.append({
+            "href": f"data:application/pdf;base64,{file_b64}",
+            "download": str(result["filename"]),
+        })
+    st.iframe(
         f"""
         <script>
         (function() {{
-            const batchKey = "bulk_download_{key}";
-            if (sessionStorage.getItem(batchKey)) return;
-            const files = [{js_array}];
+            const key = {json.dumps(key)};
+            try {{ if (sessionStorage.getItem(key)) return; }} catch (e) {{}}
+            const files = {json.dumps(files)};
             files.forEach((file, index) => {{
                 setTimeout(() => {{
                     const a = document.createElement('a');
@@ -543,14 +609,63 @@ def auto_download_many(results: List[Dict[str, object]], key: str) -> None:
                     a.download = file.download;
                     document.body.appendChild(a);
                     a.click();
-                    document.body.removeChild(a);
+                    a.remove();
                 }}, index * 500);
             }});
-            sessionStorage.setItem(batchKey, '1');
+            try {{ sessionStorage.setItem(key, '1'); }} catch (e) {{}}
         }})();
         </script>
         """,
-        height=0,
+        height=1,
+        tab_index=-1,
+    )
+    st.session_state.auto_downloaded.add(key)
+    st.session_state.auto_downloaded.update(str(result["auto_key"]) for result in results)
+
+
+def auto_download_one(result: Dict[str, object]) -> None:
+    key = str(result["auto_key"])
+    if key in st.session_state.auto_downloaded:
+        return
+    if int(result["size_bytes"]) > AUTO_FILE_BYTES:
+        st.caption("Para este archivo grande, utiliza el botón de descarga.")
+        return
+    emit_auto_downloads([result], key)
+
+
+def auto_download_many(results: List[Dict[str, object]], key: str) -> None:
+    if not results or key in st.session_state.auto_downloaded:
+        return
+    eligible = []
+    total_bytes = 0
+    for result in results:
+        size = int(result["size_bytes"])
+        if str(result["auto_key"]) in st.session_state.auto_downloaded:
+            continue
+        if size <= AUTO_FILE_BYTES and total_bytes + size <= AUTO_BATCH_BYTES:
+            eligible.append(result)
+            total_bytes += size
+    if eligible:
+        emit_auto_downloads(eligible, key)
+    else:
+        st.session_state.auto_downloaded.add(key)
+    st.caption(
+        "La descarga automática se limita a archivos de hasta 8 MB y a 16 MB por lote. "
+        "Todos los archivos listos pueden descargarse con sus botones."
+    )
+
+
+def render_download_button(result: Dict[str, object], key: str) -> None:
+    path = Path(str(result["pdf_path"]))
+    st.download_button(
+        label=f"Descargar: {result['filename']}",
+        # Pasar la función, sin ejecutarla: Streamlit lee solo al hacer clic.
+        data=path.read_bytes,
+        file_name=str(result["filename"]),
+        mime="application/pdf",
+        key=key,
+        on_click="ignore",
+        width="stretch",
     )
 
 
@@ -563,63 +678,62 @@ def process_images_workflow(
     progress_bar,
     status_box,
     info_box,
-) -> Tuple[bytes, List[str]]:
+) -> Tuple[Path, List[str]]:
     edition = EDITIONS[edition_name]
     start_page = int(edition["start_page"])
-    images_data: List[Dict[str, object]] = []
+    output_path = new_pdf_path()
+    valid_pages = 0
     logs: List[str] = []
     consecutive_failures = 0
     attempts = 0
     page = start_page
 
-    while attempts < int(max_attempts):
-        url = build_milenio_or_universal_url(edition_name, selected_date, page)
-        attempts += 1
+    try:
+        while attempts < int(max_attempts):
+            url = build_milenio_or_universal_url(edition_name, selected_date, page)
+            attempts += 1
+            try:
+                image_bytes, _ = fetch_image(url)
+                try:
+                    append_image_to_pdf(image_bytes, output_path, append=valid_pages > 0)
+                finally:
+                    del image_bytes
+                valid_pages += 1
+                consecutive_failures = 0
+                logs.append(f"✓ Página {page} descargada y añadida al PDF")
+            except (ResourceLimitError, PdfWriteError):
+                # No presentar como completo un archivo interrumpido por tamaño.
+                raise
+            except Exception as exc:
+                consecutive_failures += 1
+                logs.append(
+                    f"✗ Página {page} falló ({consecutive_failures}/{int(max_consecutive_failures)}): {exc}"
+                )
+                if consecutive_failures >= int(max_consecutive_failures):
+                    logs.append("Se alcanzó el límite de fallos consecutivos. Fin del proceso.")
+                    progress_bar.progress(min(attempts / int(max_attempts), 1.0))
+                    status_box.text("\n".join(logs[-5:]))
+                    break
 
-        try:
-            image_bytes, content_type = fetch_image(url)
-            filename = f"pagina_{str(page).zfill(2)}.jpg"
-            images_data.append(
-                {
-                    "page_number": page,
-                    "url": url,
-                    "bytes": image_bytes,
-                    "filename": filename,
-                    "content_type": content_type,
-                }
+            progress_bar.progress(min(attempts / int(max_attempts), 1.0))
+            status_box.text("\n".join(logs[-5:]))
+            info_box.info(
+                f"{edition_name} | Páginas válidas: {valid_pages} | "
+                f"Intento: {attempts}/{int(max_attempts)} | Página actual: {page}"
             )
-            consecutive_failures = 0
-            logs.append(f"✓ Página {page} descargada")
-        except Exception as exc:
-            consecutive_failures += 1
-            logs.append(
-                f"✗ Página {page} falló ({consecutive_failures}/{int(max_consecutive_failures)}): {exc}"
-            )
-            if consecutive_failures >= int(max_consecutive_failures):
-                logs.append("Se alcanzó el límite de fallos consecutivos. Fin del proceso.")
-                progress_bar.progress(min(attempts / int(max_attempts), 1.0))
-                status_box.text("\n".join(logs[-12:]))
-                break
+            page += 1
+            if delay_seconds > 0:
+                time.sleep(float(delay_seconds))
 
-        progress_bar.progress(min(attempts / int(max_attempts), 1.0))
-        status_box.text("\n".join(logs[-12:]))
-        info_box.info(
-            f"{edition_name} | Páginas válidas: {len(images_data)} | "
-            f"Intento: {attempts}/{int(max_attempts)} | Página actual: {page}"
-        )
-
-        page += 1
-        if delay_seconds > 0:
-            time.sleep(float(delay_seconds))
-
-    if not images_data:
-        raise RuntimeError("No se encontró ninguna imagen válida")
-
-    info_box.info(f"{edition_name} | Generando PDF con {len(images_data)} páginas...")
-    pdf_bytes = generate_pdf(images_data)
-    logs.append(f"✓ PDF generado con {len(images_data)} páginas")
-    status_box.text("\n".join(logs[-12:]))
-    return pdf_bytes, logs
+        if valid_pages == 0:
+            raise RuntimeError("No se encontró ninguna imagen válida")
+        logs.append(f"✓ PDF generado con {valid_pages} páginas")
+        status_box.text("\n".join(logs[-5:]))
+        progress_bar.progress(1.0)
+        return output_path, logs
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        raise
 
 
 def process_direct_pdf_workflow(
@@ -627,16 +741,21 @@ def process_direct_pdf_workflow(
     selected_date: date,
     status_box,
     info_box,
-) -> Tuple[bytes, List[str]]:
+) -> Tuple[Path, List[str]]:
     logs: List[str] = []
     url = build_direct_pdf_url(edition_name, selected_date)
     logs.append(f"Intentando descarga directa del PDF: {url}")
-    status_box.text("\n".join(logs[-12:]))
+    status_box.text("\n".join(logs[-5:]))
     info_box.info(f"{edition_name} | Descargando PDF...")
-    pdf_bytes = fetch_pdf(url)
-    logs.append("✓ PDF descargado correctamente")
-    status_box.text("\n".join(logs[-12:]))
-    return pdf_bytes, logs
+    output_path = new_pdf_path()
+    try:
+        fetch_pdf(url, output_path)
+        logs.append("✓ PDF descargado correctamente")
+        status_box.text("\n".join(logs[-5:]))
+        return output_path, logs
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        raise
 
 
 def process_one_edition(
@@ -649,8 +768,7 @@ def process_one_edition(
     status_box,
     info_box,
 ) -> None:
-    st.session_state.results.pop(edition_name, None)
-    st.session_state.statuses.pop(edition_name, None)
+    remove_result(edition_name)
 
     if not is_publication_day(edition_name, selected_date):
         msg = "Hoy no se publica"
@@ -663,10 +781,11 @@ def process_one_edition(
         progress_bar.progress(1.0)
         return
 
+    pdf_path = None
     try:
         edition_type = EDITIONS[edition_name]["type"]
         if edition_type in {"milenio", "el_universal"}:
-            pdf_bytes, logs = process_images_workflow(
+            pdf_path, logs = process_images_workflow(
                 edition_name=edition_name,
                 selected_date=selected_date,
                 max_attempts=max_attempts,
@@ -677,7 +796,7 @@ def process_one_edition(
                 info_box=info_box,
             )
         else:
-            pdf_bytes, logs = process_direct_pdf_workflow(
+            pdf_path, logs = process_direct_pdf_workflow(
                 edition_name=edition_name,
                 selected_date=selected_date,
                 status_box=status_box,
@@ -685,7 +804,7 @@ def process_one_edition(
             )
             progress_bar.progress(1.0)
 
-        save_result(edition_name, selected_date, pdf_bytes, logs)
+        save_result(edition_name, selected_date, pdf_path, logs)
         st.session_state.statuses[edition_name] = {
             "state": "ok",
             "message": "Archivo listo",
@@ -694,6 +813,10 @@ def process_one_edition(
         st.session_state.last_single_auto_key = st.session_state.results[edition_name]["auto_key"]
         info_box.success("Archivo listo")
     except Exception as exc:
+        remove_result(edition_name)
+        if pdf_path is not None:
+            pdf_path.unlink(missing_ok=True)
+        LOGGER.exception("Error al procesar %s, fecha %s", edition_name, selected_date)
         msg = f"No se pudo completar: {exc}"
         st.session_state.statuses[edition_name] = {
             "state": "error",
@@ -702,6 +825,12 @@ def process_one_edition(
         }
         info_box.error(msg)
         progress_bar.progress(1.0)
+    finally:
+        # Una cancelación/rerun de Streamlit hereda de BaseException. Si ocurre
+        # después de generar el archivo pero antes de registrarlo, limpiarlo.
+        registered = st.session_state.results.get(edition_name, {})
+        if pdf_path is not None and registered.get("pdf_path") != str(pdf_path):
+            pdf_path.unlink(missing_ok=True)
 
 
 def run_bulk_download(
@@ -711,13 +840,11 @@ def run_bulk_download(
     max_consecutive_failures: int,
     delay_seconds: float,
 ) -> None:
-    st.session_state.results = {}
-    st.session_state.statuses = {}
-    st.session_state.last_single_auto_key = None
-
     if not edition_names:
         st.warning("Selecciona al menos una edición para la descarga masiva.")
         return
+
+    clear_results()
 
     overall_progress = st.progress(0)
     overall_info = st.empty()
@@ -753,8 +880,12 @@ def run_bulk_download(
 
         overall_progress.progress(idx / total)
 
-    overall_info.success("Proceso masivo terminado")
-    st.session_state.last_bulk_key = f"{selected_date.isoformat()}_{len(st.session_state.results)}"
+    failed = sum(status["state"] == "error" for status in st.session_state.statuses.values())
+    if failed:
+        overall_info.warning(f"Proceso masivo terminado: {failed} edición(es) con error.")
+    else:
+        overall_info.success("Proceso masivo terminado")
+    st.session_state.last_bulk_key = f"bulk_{uuid.uuid4().hex}"
 
 
 def render_result_cards() -> None:
@@ -788,14 +919,7 @@ def render_result_cards() -> None:
 
             if result:
                 ready_results.append(result)
-                st.download_button(
-                    label=f"Descargar manualmente: {result['filename']}",
-                    data=result["pdf_bytes"],
-                    file_name=result["filename"],
-                    mime="application/pdf",
-                    key=f"manual_{sanitize_name(edition_name)}_{result['date']}",
-                    use_container_width=True,
-                )
+                render_download_button(result, key=f"manual_{result['auto_key']}")
 
                 with st.expander("Ver log del proceso"):
                     st.text("\n".join(result.get("logs", [])))
@@ -804,7 +928,7 @@ def render_result_cards() -> None:
                     st.text("\n".join(status.get("logs", [])))
 
     if ready_results and st.session_state.last_bulk_key:
-        st.info("En descarga masiva también se intentará la descarga automática de todos los archivos listos.")
+        st.info("Los archivos pequeños intentarán descargarse automáticamente. Usa los botones para los demás.")
         auto_download_many(ready_results, st.session_state.last_bulk_key)
 
 
@@ -813,6 +937,9 @@ def render_single_result(edition_name: str) -> None:
     status = st.session_state.statuses.get(edition_name)
 
     if not status:
+        return
+    if st.session_state.last_bulk_key:
+        # Los resultados de un lote ya tienen sus botones en la sección inferior.
         return
 
     st.subheader(f"Resultado individual: {edition_name}")
@@ -827,16 +954,9 @@ def render_single_result(edition_name: str) -> None:
             st.error(message)
 
         if result:
-            st.info("Se intentará la descarga automática de esta edición. Si el navegador la bloquea, usa el botón manual.")
+            st.info("Si el archivo es pequeño, se intentará descargar automáticamente. También puedes usar el botón.")
             auto_download_one(result)
-            st.download_button(
-                label=f"Descargar manualmente: {result['filename']}",
-                data=result["pdf_bytes"],
-                file_name=result["filename"],
-                mime="application/pdf",
-                key=f"single_manual_{sanitize_name(edition_name)}_{result['date']}",
-                use_container_width=True,
-            )
+            render_download_button(result, key=f"single_manual_{result['auto_key']}")
 
         with st.expander("Ver log del proceso"):
             logs = result.get("logs", []) if result else status.get("logs", [])
@@ -853,6 +973,12 @@ def main() -> None:
     )
 
     selected_date = st.date_input("Fecha", value=date.today())
+    # No mezclar los archivos de una fecha anterior con la fecha seleccionada.
+    if st.session_state.get("results_date") != selected_date.isoformat():
+        clear_results()
+        st.session_state.results_date = selected_date.isoformat()
+    if st.button("Limpiar resultados"):
+        clear_results()
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -894,13 +1020,14 @@ def main() -> None:
     with single_col1:
         run_single = st.button(
             "Descargar edición seleccionada",
-            use_container_width=True,
+            width="stretch",
             type="primary",
         )
     with single_col2:
-        st.caption("La app intentará descargarla automáticamente al terminar y también dejará el botón manual.")
+        st.caption("Se intentará la descarga automática de archivos pequeños; siempre quedará el botón de descarga.")
 
     if run_single:
+        st.session_state.last_bulk_key = None
         with st.container(border=True):
             st.subheader(selected_edition)
             status_box = st.empty()
@@ -917,7 +1044,7 @@ def main() -> None:
                 info_box=info_box,
             )
 
-    render_single_result(selected_edition)
+    single_result_box = st.empty()
 
     st.divider()
     st.subheader("Descarga masiva")
@@ -940,7 +1067,7 @@ def main() -> None:
 
     st.caption(f"Se procesarán {len(selected_bulk_editions)} edición(es) en la masiva.")
 
-    if st.button("Iniciar descarga masiva", use_container_width=True):
+    if st.button("Iniciar descarga masiva", width="stretch"):
         run_bulk_download(
             edition_names=selected_bulk_editions,
             selected_date=selected_date,
@@ -948,6 +1075,11 @@ def main() -> None:
             max_consecutive_failures=int(max_consecutive_failures),
             delay_seconds=float(delay_seconds),
         )
+
+    # Renderizar después de procesar los botones evita mostrar descargas de
+    # archivos que el inicio de un lote acaba de eliminar.
+    with single_result_box.container():
+        render_single_result(selected_edition)
 
     if st.session_state.statuses:
         st.divider()
